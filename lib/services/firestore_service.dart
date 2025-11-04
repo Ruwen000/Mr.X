@@ -59,6 +59,7 @@ class FirestoreService {
         .set({
       'location': GeoPoint(lat, lng),
       'ts': FieldValue.serverTimestamp(),
+      'sentAt': DateTime.now().toIso8601String(), 
     });
   }
 
@@ -69,6 +70,33 @@ class FirestoreService {
         .collection('pings')
         .doc('latest')
         .snapshots();
+  }
+
+  Future<Map<String, dynamic>?> getLatestValidPing() async {
+    final doc = await _db
+        .collection('games')
+        .doc('current')
+        .collection('pings')
+        .doc('latest')
+        .get();
+    
+    if (!doc.exists) return null;
+    
+    final data = doc.data()!;
+    final timestamp = data['ts'] as Timestamp;
+    final now = DateTime.now();
+    final pingTime = timestamp.toDate();
+    
+    // Nur Pings der letzten 10 Minuten zurückgeben
+    if (now.difference(pingTime).inMinutes <= 10) {
+      return {
+        'location': data['location'],
+        'timestamp': timestamp,
+        'isValid': true
+      };
+    }
+    
+    return null;
   }
 
   Future<void> deleteUserData({required bool isHunter}) async {

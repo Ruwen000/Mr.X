@@ -67,28 +67,56 @@ class _MapScreenState extends State<MapScreen>
     _initializeMap();
 
     if (_role == Role.hunter) {
+      _checkInitialPing();
+      
       _pingSub = _fs.pingStream().listen((docSnap) {
         if (!docSnap.exists) return;
         final geo = docSnap.data()?['location'] as GeoPoint?;
-        if (geo == null) return;
+        final timestamp = docSnap.data()?['ts'] as Timestamp?;
+        if (geo == null || timestamp == null) return;
+        
+        final now = DateTime.now();
+        final pingTime = timestamp.toDate();
+        if (now.difference(pingTime).inMinutes > 10) return;
+        
         final pos = LatLng(geo.latitude, geo.longitude);
         _updateMrXMarker(pos);
         _handleVibeAndPing(pos);
       });
     }
 
+    Future<void> _checkInitialPing() async {
+      try {
+        final pingData = await _fs.getLatestValidPing();
+        if (pingData != null && pingData['isValid'] == true) {
+          final geo = pingData['location'] as GeoPoint;
+          final pos = LatLng(geo.latitude, geo.longitude);
+          _updateMrXMarker(pos);
+        }
+      } catch (e) {
+        debugPrint("Fehler beim Laden des initialen Pings: $e");
+      }
+    }
+
     if (_role == Role.mrx) {
       _timerMrXNotify = Timer.periodic(
-        const Duration(seconds: 600),
+        const Duration(seconds: 600), // 10 Minuten
         (_) async {
-          if (_center == null) return;
           try {
-            await _fs.sendPing(_center!.latitude, _center!.longitude);
-            _handleVibeAndPing(_center!);
+            // Hole die aktuelle Position direkt vom Location Service
+            final currentPos = await LocationService.getCurrent();
+            if (currentPos.latitude == null || currentPos.longitude == null) return;
+            
+            final currentLatLng = LatLng(currentPos.latitude!, currentPos.longitude!);
+            
+            // Sende Ping mit der aktuellen Position
+            await _fs.sendPing(currentLatLng.latitude, currentLatLng.longitude);
+            _handleVibeAndPing(currentLatLng);
+            
+            debugPrint('Mr.X Ping gesendet um ${DateTime.now()}');
           } catch (e) {
-            debugPrint("❌ Fehler beim Ping senden: $e");
+            debugPrint("Fehler beim Ping senden: $e");
           }
-          debugPrint('🔔 Mr.X Ping gesendet um ${DateTime.now()}');
         },
       );
     }
@@ -256,8 +284,10 @@ class _MapScreenState extends State<MapScreen>
       _lastPingPos = pos;
       _showPulse = true;
     });
+    
     _fadeController.forward(from: 0);
-    Future.delayed(const Duration(milliseconds: 500), () {
+    
+    Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _showPulse = false);
     });
   }
