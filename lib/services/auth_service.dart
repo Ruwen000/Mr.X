@@ -1,11 +1,13 @@
 import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firestore_service.dart';
 import '../models/role.dart';
 
 class AuthService extends ChangeNotifier {
   final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
   final FirestoreService _fs;
 
   AuthService(this._fs);
@@ -62,28 +64,53 @@ class AuthService extends ChangeNotifier {
     await loadGameUsername();
   }
 
-  /// Logout und Daten löschen
   Future<void> logout({required bool deleteData}) async {
-    if (deleteData && role != null) {
-      // löscht Spiel-Location und User-Dokument
-      await _fs.deleteUserData(isHunter: role == Role.hunter);
-    } else {
-      // nur Username-Dokument löschen
-      await _fs.deleteUsername();
+    try {
+      print('🔄 Starte Logout-Prozess...');
+
+      if (deleteData) {
+        print('📝 Lösche ALLE User-Daten...');
+        await _fs.deleteUserData(isHunter: role == Role.hunter);
+      } else {
+        print('📝 Lösche nur Standort-Daten...');
+        await _fs.deleteLocationOnly(isHunter: role == Role.hunter);
+      }
+
+      // Lokale Daten KOMPLETT zurücksetzen
+      role = null;
+      _gameUsername = null; // WICHTIG: Username lokal löschen
+
+      print('🚪 Firebase SignOut...');
+      await _auth.signOut();
+
+      if (!kIsWeb) {
+        print('🔐 Google SignOut...');
+        await GoogleSignIn().signOut();
+      }
+
+      notifyListeners();
+      print('✅ Logout abgeschlossen - Alle Daten gelöscht');
+    } catch (e) {
+      print('❌ Kritischer Fehler im Logout: $e');
+      // Sicherstellen dass zumindest lokal alles gelöscht wird
+      role = null;
+      _gameUsername = null;
+      notifyListeners();
+      rethrow;
     }
-    role = null;
-    _gameUsername = null;
-    await _auth.signOut();
-    if (!kIsWeb) await GoogleSignIn().signOut();
-    notifyListeners();
   }
 
-  void setRole(Role r) {
+  Future<void> setRole(Role r) async {
     role = r;
+    // Rolle in Firestore speichern
+    await _db.collection('users').doc(uid).set({
+      'role': r == Role.mrx ? 'mrx' : 'hunter',
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
     notifyListeners();
   }
 
-  /// Neu: Nur die Rolle löschen, Username/UID bleiben erhalten
+  /// Nur die Rolle löschen
   void clearRole() {
     role = null;
     notifyListeners();

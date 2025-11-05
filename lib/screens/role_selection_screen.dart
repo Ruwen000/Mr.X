@@ -30,16 +30,28 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
     setState(() => _loading = true);
     try {
       final users = await _fs.getAllUsernames();
-      final hunters = await _fs.getAllHunterLocations();
-      final mrx = await _fs.getMrXLocation();
+
+      // ✅ VERBESSERT: Verwende die gleiche Methode wie in der Map
+      final hunters = await _fs.getAllHunterLocationsWithNames();
+      final isMrXActive = await _fs.isMrXActive();
+      final mrxUsername = await _fs.getMrXUsername();
+
       setState(() {
         _usernames = users;
-        _hunterCount = hunters.length;
-        _mrXExists = mrx != null;
+        _hunterCount = hunters.length; // Direkt die Länge der Map
+        _mrXExists = isMrXActive;
         _error = null;
       });
-    } catch (_) {
-      setState(() => _error = 'Konnte Daten nicht laden.');
+
+      // ✅ Debug-Ausgabe
+      print('🎯 Rollenauswahl - Aktive Spieler:');
+      print('- Usernames: $_usernames');
+      print('- Hunter Count: $_hunterCount');
+      print('- Mr.X existiert: $_mrXExists');
+      print('- Mr.X Username: $mrxUsername');
+    } catch (e) {
+      print('❌ Fehler in _loadData: $e');
+      setState(() => _error = 'Konnte Daten nicht laden: $e');
     } finally {
       setState(() => _loading = false);
     }
@@ -66,31 +78,40 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Abbrechen',
-                    style: TextStyle(color: Colors.white70))),
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Abbrechen',
+                  style: TextStyle(color: Colors.white70)),
+            ),
             TextButton(
-                onPressed: () => Navigator.pop(ctx, pw),
-                child: const Text('OK',
-                    style: TextStyle(color: Colors.deepPurpleAccent))),
+              onPressed: () => Navigator.pop(ctx, pw),
+              child: const Text('OK',
+                  style: TextStyle(color: Colors.deepPurpleAccent)),
+            ),
           ],
         );
       },
     );
+
     if (input != _adminPassword) {
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('Falsches Passwort!')));
       return;
     }
+
     setState(() => _loading = true);
     try {
+      print('🔄 Starte Datenlöschung...');
       await _fs.deleteAllGameData();
+      print('✅ Datenlöschung erfolgreich');
+
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Alle Spieldaten gelöscht.')));
+
       await _loadData();
     } catch (e) {
+      print('❌ Fehler beim Löschen: $e');
       ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Fehler: \$e')));
+          .showSnackBar(SnackBar(content: Text('Fehler: $e')));
     } finally {
       setState(() => _loading = false);
     }
@@ -248,10 +269,23 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
                               ],
                             ),
                             if (_mrXExists)
-                              Padding(
-                                padding: const EdgeInsets.only(top: 8),
-                                child: Text('Mr. X ist bereits vergeben',
-                                    style: TextStyle(color: Colors.redAccent)),
+                              FutureBuilder<String?>(
+                                future: _fs.getMrXUsername(),
+                                builder: (context, snapshot) {
+                                  final mrxUsername =
+                                      snapshot.data ?? 'einem Spieler';
+                                  return Padding(
+                                    padding: const EdgeInsets.only(top: 8),
+                                    child: Text(
+                                      'Mr. X ist bereits von $mrxUsername vergeben',
+                                      style: TextStyle(
+                                        color: Colors.redAccent,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  );
+                                },
                               ),
                           ],
                         ),

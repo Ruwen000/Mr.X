@@ -1,9 +1,11 @@
-// lib/screens/map_screen.dart
+import 'dart:math';
 import 'dart:async';
+import 'package:intl/intl.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:location/location.dart';
 import 'package:provider/provider.dart';
 import '../models/role.dart';
 import '../services/auth_service.dart';
@@ -29,11 +31,22 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final FirestoreService _fs = FirestoreService();
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
   final List<Marker> _markers = [];
   LatLng? _center;
   late final MapController _mapController;
+
+  LatLng? _lastSentPosition;
+  Timer? _refreshTimer;
+
+  Timer? _countdownTimer;
+  Duration _timeUntilNextPing = Duration.zero;
+  DateTime? _nextPingTime;
+
+  DateTime? _lastSuccessfulPingMrX;
+  int _failedAttemptsMrX = 0;
 
   Timer? _timerMyLoc, _timerHunters, _timerMrXNotify, _cooldownTimer;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _pingSub;
@@ -50,9 +63,101 @@ class _MapScreenState extends State<MapScreen>
   bool _abilityUsed = false;
   int _cooldown = 0;
 
+  // Berechne nächsten Ping-Zeitpunkt
+  void _calculateNextPingTime() {
+    if (_lastPingTime == null) {
+      _nextPingTime = null;
+      _timeUntilNextPing = Duration.zero;
+      return;
+    }
+
+    _nextPingTime = _lastPingTime!.add(const Duration(minutes: 1));
+    final now = DateTime.now();
+
+    if (_nextPingTime!.isAfter(now)) {
+      _timeUntilNextPing = _nextPingTime!.difference(now);
+    } else {
+      _timeUntilNextPing = Duration.zero;
+      // Ping ist überfällig - prüfe ob Mr.X noch aktiv ist
+      if (_role == Role.hunter && mounted) {
+        _checkMrXActivity();
+      }
+    }
+  }
+
+  void _startCountdownTimer() {
+    _countdownTimer?.cancel();
+    _calculateNextPingTime();
+
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+
+      setState(() {
+        if (_timeUntilNextPing.inSeconds > 0) {
+          _timeUntilNextPing = _timeUntilNextPing - const Duration(seconds: 1);
+        } else {
+          _timeUntilNextPing = Duration.zero;
+          // Wenn Countdown abgelaufen, neu berechnen (falls Ping noch nicht kam)
+          _calculateNextPingTime();
+        }
+      });
+    });
+  }
+
+  Future<void> _checkMrXActivity() async {
+    try {
+      final mrxData = await _fs.getMrXWithName();
+      if (mrxData == null) {
+        // Mr.X ist nicht mehr aktiv
+        if (mounted) {
+          setState(() {
+            _nextPingTime = null;
+            _timeUntilNextPing = Duration.zero;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Fehler beim Prüfen der Mr.X Aktivität: $e');
+    }
+  }
+
+  Future<void> _checkInitialPing() async {
+    try {
+      final pingData = await _fs.getLatestValidPing();
+      if (pingData != null && pingData['isValid'] == true) {
+        final geo = pingData['location'] as GeoPoint;
+        final timestamp = pingData['timestamp'] as Timestamp;
+        final pos = LatLng(geo.latitude, geo.longitude);
+
+        // ✅ WICHTIG: Verwende die tatsächliche Ping-Zeit, nicht die aktuelle Zeit
+        final pingTime = timestamp.toDate();
+
+        _updateMrXMarker(pos);
+
+        if (mounted) {
+          setState(() {
+            _lastPingTime = pingTime; // Echte Ping-Zeit verwenden
+            _lastPingPos = pos;
+          });
+          _startCountdownTimer();
+        }
+
+        debugPrint(
+            '🕒 Letzter Ping war um $pingTime (vor ${DateTime.now().difference(pingTime).inMinutes} Minuten)');
+      }
+    } catch (e) {
+      debugPrint("Fehler beim Laden des initialen Pings: $e");
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
     _mapController = MapController();
     final auth = context.read<AuthService>();
     _role = auth.role!;
@@ -65,107 +170,280 @@ class _MapScreenState extends State<MapScreen>
     _fadeAnim = CurvedAnimation(parent: _fadeController, curve: Curves.easeOut);
 
     _initializeMap();
+    _startCountdownTimer();
 
     if (_role == Role.hunter) {
       _checkInitialPing();
-      
+
       _pingSub = _fs.pingStream().listen((docSnap) {
         if (!docSnap.exists) return;
-        final geo = docSnap.data()?['location'] as GeoPoint?;
-        final timestamp = docSnap.data()?['ts'] as Timestamp?;
+        final data = docSnap.data();
+        final geo = data?['location'] as GeoPoint?;
+        final timestamp = data?['timestamp'] as Timestamp?;
+
         if (geo == null || timestamp == null) return;
-        
+
         final now = DateTime.now();
         final pingTime = timestamp.toDate();
-        if (now.difference(pingTime).inMinutes > 10) return;
-        
-        final pos = LatLng(geo.latitude, geo.longitude);
-        _updateMrXMarker(pos);
-        _handleVibeAndPing(pos);
+
+        if (now.difference(pingTime).inMinutes <= 1) {
+          final pos = LatLng(geo.latitude, geo.longitude);
+
+          if (mounted) {
+            setState(() {
+              _lastPingTime = pingTime;
+              _lastPingPos = pos;
+            });
+            _startCountdownTimer();
+          }
+
+          _updateMrXMarker(pos);
+          _handleVibeAndPing(pos);
+        }
       });
     }
 
-    Future<void> _checkInitialPing() async {
-      try {
-        final pingData = await _fs.getLatestValidPing();
-        if (pingData != null && pingData['isValid'] == true) {
-          final geo = pingData['location'] as GeoPoint;
-          final pos = LatLng(geo.latitude, geo.longitude);
-          _updateMrXMarker(pos);
-        }
-      } catch (e) {
-        debugPrint("Fehler beim Laden des initialen Pings: $e");
-      }
-    }
-
     if (_role == Role.mrx) {
-      _timerMrXNotify = Timer.periodic(
-        const Duration(seconds: 600), // 10 Minuten
-        (_) async {
-          try {
-            // Hole die aktuelle Position direkt vom Location Service
-            final currentPos = await LocationService.getCurrent();
-            if (currentPos.latitude == null || currentPos.longitude == null) return;
-            
-            final currentLatLng = LatLng(currentPos.latitude!, currentPos.longitude!);
-            
-            // Sende Ping mit der aktuellen Position
-            await _fs.sendPing(currentLatLng.latitude, currentLatLng.longitude);
-            _handleVibeAndPing(currentLatLng);
-            
-            debugPrint('Mr.X Ping gesendet um ${DateTime.now()}');
-          } catch (e) {
-            debugPrint("Fehler beim Ping senden: $e");
-          }
-        },
-      );
+      _startMrXTimer();
     }
+  }
+
+  // Formatierung für die Ping-Zeit
+  String _formatPingTime(DateTime pingTime) {
+    return DateFormat('HH:mm:ss').format(pingTime); // z.B. "14:30:25"
+  }
+
+  // Formatierung für Countdown
+  String _formatCountdown(Duration duration) {
+    final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+
+  Future<void> _checkLastPingTime() async {
+    try {
+      final pingData = await _fs.getLatestValidPing();
+      if (pingData != null && pingData['isValid'] == true) {
+        final timestamp = pingData['timestamp'] as Timestamp;
+        final geo = pingData['location'] as GeoPoint;
+        final pos = LatLng(geo.latitude, geo.longitude);
+
+        if (mounted) {
+          setState(() {
+            _lastPingTime = timestamp.toDate();
+            _lastPingPos = pos;
+          });
+        }
+        debugPrint('🔄 Ping-Zeit synchronisiert: ${_lastPingTime}');
+      }
+    } catch (e) {
+      debugPrint('Fehler beim Synchronisieren der Ping-Zeit: $e');
+    }
+  }
+
+  void _startMrXTimer() {
+    _timerMrXNotify?.cancel();
+
+    _timerMrXNotify = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) async {
+        try {
+          if (!mounted) return;
+
+          debugPrint('🔄 Mr.X Timer ausgeführt um ${DateTime.now()}');
+
+          if (_failedAttemptsMrX >= 3) {
+            debugPrint(
+                '⚠️ Zu viele fehlgeschlagene Versuche, Timer neu starten');
+            _failedAttemptsMrX = 0;
+            _startMrXTimer();
+            return;
+          }
+
+          final currentPos = await LocationService.getCurrent();
+          if (currentPos.latitude == null || currentPos.longitude == null) {
+            debugPrint('❌ Standortdaten sind null');
+            _failedAttemptsMrX++;
+            return;
+          }
+
+          final currentLatLng =
+              LatLng(currentPos.latitude!, currentPos.longitude!);
+          debugPrint(
+              '📍 Standort erhalten: ${currentLatLng.latitude}, ${currentLatLng.longitude}');
+
+          // Ping mit Retry-Mechanismus senden
+          bool pingSuccessful = false;
+          int retryCount = 0;
+
+          while (!pingSuccessful && retryCount < 2) {
+            try {
+              await _fs.sendPing(
+                  currentLatLng.latitude, currentLatLng.longitude);
+              pingSuccessful = true;
+              _lastSuccessfulPingMrX = DateTime.now();
+              _failedAttemptsMrX = 0;
+
+              if (mounted) {
+                setState(() {
+                  _lastPingTime = DateTime.now();
+                  _lastPingPos = currentLatLng;
+                });
+                _handleVibeAndPing(currentLatLng);
+                _startCountdownTimer();
+              }
+
+              debugPrint('✅ Ping erfolgreich gesendet um ${DateTime.now()}');
+            } catch (e) {
+              retryCount++;
+              debugPrint('❌ Ping Versuch $retryCount/2 fehlgeschlagen: $e');
+              if (retryCount < 2) {
+                await Future.delayed(const Duration(seconds: 5));
+              }
+            }
+          }
+
+          if (!pingSuccessful) {
+            _failedAttemptsMrX++;
+            debugPrint(
+                '❌ Alle Ping-Versuche fehlgeschlagen, Fehlversuche: $_failedAttemptsMrX');
+          }
+        } catch (e) {
+          _failedAttemptsMrX++;
+          debugPrint('❌ Unerwarteter Fehler im Mr.X Timer: $e');
+        }
+      },
+    );
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timerMyLoc?.cancel();
     _timerHunters?.cancel();
     _timerMrXNotify?.cancel();
     _cooldownTimer?.cancel();
+    _countdownTimer?.cancel();
     _pingSub?.cancel();
     _fadeController.dispose();
     super.dispose();
   }
 
-  Future<void> _initializeMap() async {
-    await _updateMyLocation();
-    if (_role == Role.hunter) {
-      await _fetchHunters();
-      await _fetchMrX();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // App kommt aus Standby - Daten sofort aktualisieren
+      debugPrint('🔄 App aus Standby - Aktualisiere Daten...');
+      _refreshData();
     }
-    _startTimers();
+  }
+
+  Future<void> _refreshData() async {
+    try {
+      // Hole die neuesten Ping-Daten
+      final pingData = await _fs.getLatestValidPing();
+      if (pingData != null && pingData['isValid'] == true) {
+        final timestamp = pingData['timestamp'] as Timestamp;
+        final geo = pingData['location'] as GeoPoint;
+        final pos = LatLng(geo.latitude, geo.longitude);
+        final pingTime = timestamp.toDate();
+
+        if (mounted) {
+          setState(() {
+            _lastPingTime = pingTime;
+            _lastPingPos = pos;
+          });
+          _startCountdownTimer(); // ✅ Countdown neu starten
+        }
+        debugPrint('✅ Ping-Daten aktualisiert: ${_formatPingTime(pingTime)}');
+      }
+
+      // Aktualisiere Hunter-Positionen falls nötig
+      if (_role == Role.hunter) {
+        await _fetchHunters();
+      }
+
+      // ✅ Auch für Mr.X: Position aktualisieren
+      await _updateMyLocation();
+    } catch (e) {
+      debugPrint('❌ Fehler beim Aktualisieren: $e');
+    }
+  }
+
+  Future<void> _initializeMap() async {
+    print('🔄 _initializeMap started');
+    try {
+      await _updateMyLocation();
+      print('✅ _updateMyLocation completed');
+
+      if (_role == Role.hunter) {
+        await _fetchHunters();
+        print('✅ _fetchHunters completed');
+        await _fetchMrX();
+        print('✅ _fetchMrX completed');
+      }
+      _startTimers();
+      print('✅ _startTimers completed');
+    } catch (e) {
+      print('❌ _initializeMap failed: $e');
+    }
   }
 
   void _startTimers() {
     _timerMyLoc = Timer.periodic(
-      const Duration(seconds: 5),
+      const Duration(seconds: 30),
       (_) => _updateMyLocation(),
     );
     if (_role == Role.hunter) {
       _timerHunters = Timer.periodic(
-        const Duration(seconds: 5),
+        const Duration(seconds: 30),
         (_) => _fetchHunters(),
       );
     }
   }
 
+  double _calculateDistance(LatLng pos1, LatLng pos2) {
+    const R = 6371000.0;
+    final lat1 = pos1.latitude * pi / 180;
+    final lat2 = pos2.latitude * pi / 180;
+    final dLat = (pos2.latitude - pos1.latitude) * pi / 180;
+    final dLng = (pos2.longitude - pos1.longitude) * pi / 180;
+
+    final a = sin(dLat / 2) * sin(dLat / 2) +
+        sin(dLng / 2) * sin(dLng / 2) * cos(lat1) * cos(lat2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return R * c;
+  }
+
   Future<void> _updateMyLocation() async {
+    print('🔄 _updateMyLocation started');
     try {
       final pos = await LocationService.getCurrent();
-      if (pos.latitude == null || pos.longitude == null) return;
+      print('📍 Location received: ${pos.latitude}, ${pos.longitude}');
+
+      if (pos.latitude == null || pos.longitude == null) {
+        print('❌ Invalid location data');
+        return;
+      }
+
       final myLatLng = LatLng(pos.latitude!, pos.longitude!);
+      print('📍 LatLng created: $myLatLng');
+
+      // Bewegung prüfen
+      if (_lastSentPosition != null &&
+          _calculateDistance(_lastSentPosition!, myLatLng) < 20) {
+        print('📏 Movement < 20m, skipping update');
+        return;
+      }
 
       await _fs.sendLocation(
         lat: pos.latitude!,
         lng: pos.longitude!,
         isHunter: _role == Role.hunter,
       );
+      print('✅ Location sent to Firestore');
+
+      _lastSentPosition = myLatLng;
 
       final meMarker = Marker(
         key: const ValueKey('me'),
@@ -182,12 +460,14 @@ class _MapScreenState extends State<MapScreen>
       );
 
       setState(() {
-        _center ??= myLatLng;
+        _center = myLatLng;
+        print('🎯 Center set to: $_center');
         _markers.removeWhere((m) => m.key == const ValueKey('me'));
         _markers.add(meMarker);
+        print('📍 Marker added');
       });
     } catch (e) {
-      debugPrint('Update my location failed: $e');
+      print('❌ _updateMyLocation failed: $e');
     }
   }
 
@@ -228,7 +508,7 @@ class _MapScreenState extends State<MapScreen>
         }
       });
     } catch (e) {
-      debugPrint('Fetch hunters failed: $e');
+      print('Fetch hunters failed: $e');
     }
   }
 
@@ -239,11 +519,10 @@ class _MapScreenState extends State<MapScreen>
       final pos = LatLng(info['latitude'], info['longitude']);
       _updateMrXMarker(pos);
     } catch (e) {
-      debugPrint('Fetch Mr.X failed: $e');
+      print('Fetch Mr.X failed: $e');
     }
   }
 
-  /// Zeigt immer hardcoded "Mr.X" an
   void _updateMrXMarker(LatLng pos) {
     setState(() {
       _markers.removeWhere((m) => m.key == const ValueKey('mrx'));
@@ -279,35 +558,63 @@ class _MapScreenState extends State<MapScreen>
   }
 
   void _triggerPingVisual(LatLng pos) {
+    if (!mounted) return;
+
     setState(() {
       _lastPingTime = DateTime.now();
       _lastPingPos = pos;
       _showPulse = true;
     });
-    
+
     _fadeController.forward(from: 0);
-    
+
+    // Zeige die Pulse-Animation für 2 Sekunden
     Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) setState(() => _showPulse = false);
+      if (mounted) {
+        setState(() => _showPulse = false);
+      }
     });
   }
 
   void _useAbility() async {
     if (_abilityUsed) return;
+
     setState(() {
       _abilityUsed = true;
-      _cooldown = 1800;
+      _cooldown = 1800; // 30 Minuten in Sekunden
     });
     _startCooldownTimer();
 
     try {
+      print('🎯 Mr.X Fähigkeit aktiviert - Lade Hunter-Positionen...');
       final data = await _fs.getAllHunterLocationsWithNames();
+
+      if (data.isEmpty) {
+        print('❌ Keine Hunter-Positionen verfügbar');
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Keine Hunter-Positionen verfügbar'),
+          duration: Duration(seconds: 3),
+        ));
+        // Reset cooldown wenn keine Daten verfügbar
+        setState(() {
+          _abilityUsed = false;
+          _cooldown = 0;
+        });
+        return;
+      }
+
+      print('✅ ${data.length} Hunter-Positionen geladen');
+
       setState(() {
+        // Entferne alte Ability-Marker
         _markers.removeWhere((m) =>
             m.key is ValueKey<String> &&
             (m.key as ValueKey<String>).value.startsWith('ability_'));
+
+        // Füge neue Ability-Marker hinzu
         for (var entry in data.entries) {
-          if (entry.key == _uid) continue;
+          if (entry.key == _uid) continue; // Überspringe sich selbst
+
           final pt = LatLng(entry.value['latitude'], entry.value['longitude']);
           _markers.add(
             Marker(
@@ -334,25 +641,51 @@ class _MapScreenState extends State<MapScreen>
             ),
           );
         }
-        final pts = _markers.map((m) => m.point).toList();
-        if (pts.isNotEmpty) {
-          _mapController.fitBounds(
-            LatLngBounds.fromPoints(pts),
-            options: const FitBoundsOptions(padding: EdgeInsets.all(50)),
-          );
-        }
+      });
+
+      // Zoom auf alle Hunter-Positionen
+      final hunterPoints = data.values
+          .map((hunter) => LatLng(hunter['latitude'], hunter['longitude']))
+          .toList();
+
+      if (hunterPoints.isNotEmpty) {
+        _mapController.fitBounds(
+          LatLngBounds.fromPoints(hunterPoints),
+          options: const FitBoundsOptions(padding: EdgeInsets.all(50)),
+        );
+        print('✅ Karte auf Hunter-Positionen gezoomt');
+      }
+
+      // Zeige Erfolgsmeldung
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            'Hunter-Positionen sichtbar für 60 Sekunden (${data.length} Hunter)'),
+        duration: Duration(seconds: 4),
+      ));
+
+      // Entferne die Marker nach 60 Sekunden
+      Future.delayed(const Duration(seconds: 60), () {
+        if (!mounted) return;
+        setState(() {
+          _markers.removeWhere((m) =>
+              m.key is ValueKey<String> &&
+              (m.key as ValueKey<String>).value.startsWith('ability_'));
+        });
+        print('✅ Ability-Marker entfernt');
       });
     } catch (e) {
-      debugPrint('Ability fetch failed: $e');
-    }
-    Future.delayed(const Duration(seconds: 60), () {
-      if (!mounted) return;
+      print('❌ Ability fetch failed: $e');
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Fehler beim Laden der Hunter-Positionen: $e'),
+        duration: Duration(seconds: 4),
+      ));
+
+      // Reset bei Fehler
       setState(() {
-        _markers.removeWhere((m) =>
-            m.key is ValueKey<String> &&
-            (m.key as ValueKey<String>).value.startsWith('ability_'));
+        _abilityUsed = false;
+        _cooldown = 0;
       });
-    });
+    }
   }
 
   void _startCooldownTimer() {
@@ -368,6 +701,21 @@ class _MapScreenState extends State<MapScreen>
         setState(() => _cooldown--);
       }
     });
+  }
+
+  String _formatTimeDifference(DateTime pingTime) {
+    final now = DateTime.now();
+    final difference = now.difference(pingTime);
+
+    if (difference.inMinutes < 1) {
+      return 'vor wenigen Sekunden';
+    } else if (difference.inMinutes < 60) {
+      return 'vor ${difference.inMinutes} Minuten';
+    } else if (difference.inHours < 24) {
+      return 'vor ${difference.inHours} Stunden';
+    } else {
+      return 'vor ${difference.inDays} Tagen';
+    }
   }
 
   @override
@@ -395,15 +743,44 @@ class _MapScreenState extends State<MapScreen>
         title: Text(_role == Role.hunter ? 'Hunter-View' : 'Mr.X-View'),
         leading: BackButton(
           onPressed: () async {
-            await _fs.deleteLocationOnly(isHunter: _role == Role.hunter);
-            auth.clearRole();
-            Navigator.of(context).pushReplacementNamed('/roleselect');
+            print('🔄 Back-Button gedrückt');
+            try {
+              await _fs.deleteLocationOnly(isHunter: _role == Role.hunter);
+              print('✅ Location gelöscht');
+
+              await _db.collection('users').doc(_uid).update({
+                'role': FieldValue.delete(),
+              });
+              print('✅ Rolle in Firestore gelöscht');
+
+              final auth = context.read<AuthService>();
+              auth.clearRole();
+              print('✅ Lokale Rolle gelöscht');
+
+              Navigator.of(context).pushReplacementNamed('/roleselect');
+              print('✅ Navigation zur RoleSelection');
+            } catch (e) {
+              print('❌ Fehler im Back-Button: $e');
+              // Fallback: Direkte Navigation
+              Navigator.of(context).pushReplacementNamed('/roleselect');
+            }
           },
         ),
         actions: [
           IconButton(
             icon: const Icon(Icons.logout, color: Colors.white),
-            onPressed: () => auth.logout(deleteData: true),
+            onPressed: () async {
+              print('🔄 Logout-Button gedrückt');
+              try {
+                await auth.logout(deleteData: true);
+                print('✅ Logout erfolgreich');
+              } catch (e) {
+                print('❌ Fehler im Logout: $e');
+                // Fallback: Direkter Logout
+                final auth = context.read<AuthService>();
+                await auth.logout(deleteData: true);
+              }
+            },
           ),
         ],
       ),
@@ -429,12 +806,53 @@ class _MapScreenState extends State<MapScreen>
                 child: Container(
                   color: Colors.black54,
                   padding:
-                      const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-                  child: Text(
-                    'Letzter Mr.X Ping um ${TimeOfDay.fromDateTime(_lastPingTime!).format(context)} '
-                    'bei (${_lastPingPos!.latitude.toStringAsFixed(5)}, '
-                    '${_lastPingPos!.longitude.toStringAsFixed(5)})',
-                    style: const TextStyle(color: Colors.white),
+                      const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Ping-Zeit und Position
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Expanded(
+                            child: Text(
+                              'Letzter Ping: ${_formatPingTime(_lastPingTime!)}',
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                          if (_timeUntilNextPing.inSeconds > 0)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: _timeUntilNextPing.inMinutes < 1
+                                    ? Colors.redAccent
+                                    : Colors.greenAccent,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                'Nächster: ${_formatCountdown(_timeUntilNextPing)}',
+                                style: const TextStyle(
+                                  color: Colors.black,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Position: ${_lastPingPos!.latitude.toStringAsFixed(5)}, '
+                        '${_lastPingPos!.longitude.toStringAsFixed(5)}',
+                        style: const TextStyle(
+                            color: Colors.white70, fontSize: 12),
+                      ),
+                    ],
                   ),
                 ),
               ),
