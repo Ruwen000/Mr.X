@@ -29,6 +29,11 @@
             android:name="com.lyokone.location.LocationService"
             android:foregroundServiceType="location" />
 
+        <service
+            android:name="com.example.mr_x_app.MrXBackgroundService"
+            android:enabled="true"
+            android:exported="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

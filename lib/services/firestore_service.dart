@@ -155,7 +155,7 @@ class FirestoreService {
       final now = DateTime.now();
       final pingTime = timestamp.toDate();
       final isValid =
-          now.difference(pingTime).inMinutes <= 1; // 10 Minuten gültig
+          now.difference(pingTime).inMinutes <= 1; // 1 Minuten gültig
 
       return {
         'location': location,

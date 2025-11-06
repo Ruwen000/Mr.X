@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 import 'dart:async';
 import 'package:intl/intl.dart';
@@ -6,12 +7,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:location/location.dart';
+import 'package:mr_x_app/services/background_service.dart';
 import 'package:provider/provider.dart';
 import '../models/role.dart';
 import '../services/auth_service.dart';
 import '../services/firestore_service.dart';
 import '../services/location_service.dart';
 import 'package:flutter/services.dart';
+import 'dart:convert';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class Vibe {
   static const MethodChannel _channel = MethodChannel('app.channel.vibration');
@@ -20,6 +24,31 @@ class Vibe {
       await _channel.invokeMethod('vibrate', {'duration': duration});
     } on PlatformException {
       // ignore
+    }
+  }
+}
+
+class BackgroundService {
+  static Future<void> startMrXBackgroundService() async {
+    try {
+      const MethodChannel channel =
+          MethodChannel('com.example.mr_x_app/background');
+      await channel.invokeMethod('startMrXBackgroundService');
+      print('✅ Mr.X Background Service gestartet');
+    } catch (e) {
+      print('⚠️ Background Service nicht verfügbar: $e');
+      // Kein Fehler werfen - App soll trotzdem funktionieren
+    }
+  }
+
+  static Future<void> stopMrXBackgroundService() async {
+    try {
+      const MethodChannel channel =
+          MethodChannel('com.example.mr_x_app/background');
+      await channel.invokeMethod('stopMrXBackgroundService');
+      print('✅ Mr.X Background Service gestoppt');
+    } catch (e) {
+      print('⚠️ Background Service nicht verfügbar: $e');
     }
   }
 }
@@ -65,6 +94,8 @@ class _MapScreenState extends State<MapScreen>
 
   bool _abilityUsed = false;
   int _cooldown = 0;
+
+  bool _backgroundServiceRunning = false;
 
   // Berechne nächsten Ping-Zeitpunkt
 // KORRIGIERT: _calculateNextPingTime
@@ -162,10 +193,14 @@ class _MapScreenState extends State<MapScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
+    print('🎯 INIT STATE STARTED - Mr.X Map Screen');
+
     _mapController = MapController();
     final auth = context.read<AuthService>();
     _role = auth.role!;
     _uid = auth.uid;
+
+    print('🔐 Rolle: $_role, UID: $_uid');
 
     _fadeController = AnimationController(
       vsync: this,
@@ -173,21 +208,77 @@ class _MapScreenState extends State<MapScreen>
     );
     _fadeAnim = CurvedAnimation(parent: _fadeController, curve: Curves.easeOut);
 
-    // ✅ KORREKTE REIHENFOLGE: Erst Map initialisieren, DANN Timer
+    // ✅ VERBESSERT: Timer SOFORT starten (nicht erst nach _initializeMap)
+    print('🔄 Starte Systeme...');
+
+    // 1. Mr.X Status Checker für ALLE Rollen starten
+    _startMrXStatusChecker();
+    print('✅ Mr.X Status Checker gestartet');
+
+    // 2. Rollenspezifische Systeme SOFORT starten
+    if (_role == Role.hunter) {
+      print('🎯 Starte Hunter-Systeme...');
+      _setupPingStream();
+    } else if (_role == Role.mrx) {
+      print('🎭 Starte Mr.X-Systeme...');
+      _startMrXTimer(); // ✅ WICHTIG: Timer SOFORT starten
+      _startBackgroundService();
+    }
+
+    // 3. Dann Map initialisieren (asynchron)
+    print('🗺️ Starte Map-Initialisierung...');
     _initializeMap().then((_) {
       if (mounted) {
-        _startMrXStatusChecker();
+        print('✅ Map-Initialisierung abgeschlossen');
 
+        // 4. Nach Map-Init: Zusätzliche Hunter-Checks
         if (_role == Role.hunter) {
           _checkInitialPing();
-          _setupPingStream();
         }
 
-        if (_role == Role.mrx) {
+        // ✅ SICHERHEITS-FALLBACK: Prüfe ob Mr.X Timer wirklich läuft
+        if (_role == Role.mrx &&
+            (_timerMrXNotify == null || !_timerMrXNotify!.isActive)) {
+          print('🔄 SICHERHEIT: Starte Mr.X Timer in Callback...');
           _startMrXTimer();
         }
       }
+    }).catchError((e) {
+      print('❌ Fehler in Map-Initialisierung: $e');
+      // ✅ SICHERHEITS-FALLBACK: Stelle sicher, dass Timer laufen
+      if (mounted && _role == Role.mrx) {
+        print('🔄 Fallback: Starte Mr.X Timer nach Fehler...');
+        _startMrXTimer();
+      }
     });
+  }
+
+  void _startBackgroundService() async {
+    try {
+      await BackgroundService.startMrXBackgroundService();
+      if (mounted) {
+        setState(() {
+          _backgroundServiceRunning = true;
+        });
+      }
+      print('✅ Mr.X Background Service aktiv');
+    } catch (e) {
+      print('❌ Background Service konnte nicht gestartet werden: $e');
+    }
+  }
+
+  void _stopBackgroundService() async {
+    try {
+      await BackgroundService.stopMrXBackgroundService();
+      if (mounted) {
+        setState(() {
+          _backgroundServiceRunning = false;
+        });
+      }
+      print('✅ Mr.X Background Service gestoppt');
+    } catch (e) {
+      print('❌ Background Service konnte nicht gestoppt werden: $e');
+    }
   }
 
   void _setupPingStream() {
@@ -204,7 +295,7 @@ class _MapScreenState extends State<MapScreen>
       final now = DateTime.now();
 
       // ✅ KONSISTENT: Gleiche Validitätsprüfung wie in getLatestValidPing
-      if (now.difference(pingTime).inMinutes <= 10) {
+      if (now.difference(pingTime).inMinutes <= 1) {
         // 10 Minuten wie in FirestoreService
         final pos = LatLng(geo.latitude, geo.longitude);
 
@@ -296,90 +387,188 @@ class _MapScreenState extends State<MapScreen>
   }
 
   void _startMrXTimer() {
+    print('🔄 _startMrXTimer: Starte Timer...');
+
+    // ✅ Zuerst alten Timer stoppen
     _timerMrXNotify?.cancel();
 
+    print('🎯 Mr.X User ID: $_uid');
+    print('📱 Widget mounted: $mounted');
+
     _timerMrXNotify = Timer.periodic(
-      const Duration(minutes: 1), // Test: 1 Minute, Produktion: 10 Minuten
-      (_) async {
+      const Duration(minutes: 1), // 1 Minute
+      (Timer timer) async {
         try {
-          if (!mounted) return;
+          print('⏰ Mr.X Timer CALLBACK aufgerufen um ${DateTime.now()}');
+
+          if (!mounted) {
+            print('❌ Timer: Widget nicht mounted, breche ab');
+            timer.cancel();
+            return;
+          }
 
           // ✅ Sicherheitsprüfung: Nur wenn Mr.X noch aktiv
-          final isStillMrX = context.read<AuthService>().role == Role.mrx;
-          if (!isStillMrX) {
-            _timerMrXNotify?.cancel();
+          final auth = Provider.of<AuthService>(context, listen: false);
+          if (auth.role != Role.mrx) {
+            print('❌ Timer: Mr.X Rolle nicht aktiv, breche ab');
+            timer.cancel();
             return;
           }
 
-          debugPrint('🔄 Mr.X Timer ausgeführt um ${DateTime.now()}');
-
-          if (_failedAttemptsMrX >= 3) {
-            debugPrint('⚠️ Timer neu starten nach Fehlversuchen');
-            _failedAttemptsMrX = 0;
-            _startMrXTimer();
-            return;
-          }
-
-          final currentPos = await LocationService.getCurrent();
-          if (currentPos.latitude == null || currentPos.longitude == null) {
-            debugPrint('❌ Standortdaten sind null');
-            _failedAttemptsMrX++;
-            return;
-          }
-
-          final currentLatLng =
-              LatLng(currentPos.latitude!, currentPos.longitude!);
-
-          // Ping mit Retry-Mechanismus senden
-          bool pingSuccessful = false;
-          int retryCount = 0;
-
-          while (!pingSuccessful && retryCount < 3) {
-            try {
-              await _fs.sendPing(
-                  currentLatLng.latitude, currentLatLng.longitude);
-              pingSuccessful = true;
-              _lastSuccessfulPingMrX = DateTime.now();
-              _failedAttemptsMrX = 0;
-
-              if (mounted) {
-                setState(() {
-                  _lastPingTime = DateTime.now();
-                  _lastPingPos = currentLatLng;
-                });
-                _handleVibeAndPing(currentLatLng);
-                _startCountdownTimer();
-              }
-
-              debugPrint('✅ Ping erfolgreich gesendet um ${DateTime.now()}');
-            } catch (e) {
-              retryCount++;
-              debugPrint('❌ Ping Versuch $retryCount/3 fehlgeschlagen: $e');
-              if (retryCount < 3) {
-                await Future.delayed(const Duration(seconds: 5));
-              }
-            }
-          }
-
-          if (!pingSuccessful) {
-            _failedAttemptsMrX++;
-            debugPrint('❌ Alle Ping-Versuche fehlgeschlagen');
-          }
+          print('🔄 Mr.X Timer AUSGEFÜHRT um ${DateTime.now()}');
+          await _sendMrXPingWithRetry();
         } catch (e) {
-          _failedAttemptsMrX++;
-          debugPrint('❌ Unerwarteter Fehler im Mr.X Timer: $e');
-
-          // ✅ SICHERHEIT: Timer neu starten bei Fehlern
-          if (mounted) {
-            _startMrXTimer();
-          }
+          print('❌ Unerwarteter Fehler im Mr.X Timer: $e');
         }
       },
     );
+
+    print('✅ Mr.X Timer GESTARTET - nächster Ping in 1 Minute');
+    print('📊 Timer aktiv: ${_timerMrXNotify?.isActive}');
+
+    // ✅ Zusätzliche Sicherheitsprüfung nach 3 Sekunden
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted && _role == Role.mrx) {
+        print('🔍 Timer Status Check: Aktiv = ${_timerMrXNotify?.isActive}');
+        if (_timerMrXNotify == null || !_timerMrXNotify!.isActive) {
+          print('🔄 Timer war nicht aktiv - starte neu...');
+          _startMrXTimer();
+        }
+      }
+    });
+  }
+
+  Future<void> _sendMrXPingWithRetry() async {
+    bool pingSuccessful = false;
+    int retryCount = 0;
+    final maxRetries = 3;
+
+    while (!pingSuccessful && retryCount < maxRetries) {
+      try {
+        final currentPos = await LocationService.getCurrent();
+        if (currentPos.latitude == null || currentPos.longitude == null) {
+          debugPrint('❌ Standortdaten sind null');
+          retryCount++;
+          await Future.delayed(const Duration(seconds: 5));
+          continue;
+        }
+
+        final currentLatLng =
+            LatLng(currentPos.latitude!, currentPos.longitude!);
+
+        debugPrint('📍 Versuche Ping zu senden...');
+        await _fs.sendPing(currentLatLng.latitude, currentLatLng.longitude);
+
+        pingSuccessful = true;
+        _lastSuccessfulPingMrX = DateTime.now();
+        _failedAttemptsMrX = 0;
+
+        if (mounted) {
+          setState(() {
+            _lastPingTime = DateTime.now();
+            _lastPingPos = currentLatLng;
+          });
+          _handleVibeAndPing(currentLatLng);
+          _startCountdownTimer();
+        }
+
+        debugPrint('✅ Ping erfolgreich gesendet um ${DateTime.now()}');
+      } catch (e) {
+        retryCount++;
+        debugPrint('❌ Ping Versuch $retryCount/$maxRetries fehlgeschlagen: $e');
+
+        // OFFLINE-FALLBACK: Lokal speichern
+        if (retryCount == maxRetries) {
+          try {
+            final currentPos = await LocationService.getCurrent();
+            if (currentPos.latitude != null && currentPos.longitude != null) {
+              _savePingForLater(currentPos.latitude!, currentPos.longitude!);
+            }
+          } catch (e) {
+            debugPrint('❌ Fehler beim Speichern für später: $e');
+          }
+        }
+
+        if (retryCount < maxRetries) {
+          await Future.delayed(const Duration(seconds: 10));
+        }
+      }
+    }
+
+    if (!pingSuccessful) {
+      _failedAttemptsMrX++;
+      debugPrint('❌ Alle Ping-Versuche fehlgeschlagen');
+    }
+  }
+
+  void _savePingForLater(double lat, double lng) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final pendingPings = prefs.getStringList('pending_pings') ?? [];
+
+      final pingData = {
+        'lat': lat.toString(),
+        'lng': lng.toString(),
+        'timestamp': DateTime.now().toIso8601String(),
+      };
+
+      pendingPings.add(json.encode(pingData));
+      await prefs.setStringList('pending_pings', pendingPings);
+
+      debugPrint('💾 Ping lokal gespeichert für späteren Versand: $lat, $lng');
+    } catch (e) {
+      debugPrint('❌ Fehler beim Speichern des Pings: $e');
+    }
+  }
+
+  void _sendPendingPings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final pendingPings = prefs.getStringList('pending_pings') ?? [];
+
+      if (pendingPings.isEmpty) return;
+
+      debugPrint('🔄 Sende ${pendingPings.length} ausstehende Pings...');
+
+      final successfulPings = <String>[];
+
+      for (final pingJson in pendingPings) {
+        try {
+          final pingData = json.decode(pingJson);
+          final lat = double.parse(pingData['lat']);
+          final lng = double.parse(pingData['lng']);
+
+          await _fs.sendPing(lat, lng);
+          successfulPings.add(pingJson);
+          debugPrint('✅ Ausstehender Ping gesendet: $lat, $lng');
+
+          // Kurze Pause zwischen Pings
+          await Future.delayed(const Duration(seconds: 1));
+        } catch (e) {
+          debugPrint('❌ Fehler beim Senden eines ausstehenden Pings: $e');
+          // Breche nicht ab, versuche nächsten Ping
+        }
+      }
+
+      // Entferne erfolgreiche Pings
+      final remainingPings = pendingPings
+          .where((ping) => !successfulPings.contains(ping))
+          .toList();
+      await prefs.setStringList('pending_pings', remainingPings);
+
+      debugPrint(
+          '✅ ${successfulPings.length} ausstehende Pings erfolgreich gesendet');
+    } catch (e) {
+      debugPrint('❌ Fehler in _sendPendingPings: $e');
+    }
   }
 
   @override
   void dispose() {
+    if (_role == Role.mrx) {
+      _stopBackgroundService();
+    }
+
     WidgetsBinding.instance.removeObserver(this);
     _timerMyLoc?.cancel();
     _timerHunters?.cancel();
@@ -433,30 +622,28 @@ class _MapScreenState extends State<MapScreen>
     }
   }
 
-// KORRIGIERT: _initializeMap mit besserem Error-Handling
   Future<void> _initializeMap() async {
     print('🔄 _initializeMap started');
     try {
       await _updateMyLocation();
       print('✅ _updateMyLocation completed');
 
+      if (_role == Role.mrx) {
+        _sendPendingPings();
+      }
+
       if (_role == Role.hunter) {
         await _fetchHunters();
         print('✅ _fetchHunters completed');
 
-        // ✅ Mr.X nur anzeigen wenn aktiv UND gültiger Ping existiert
-        final isActive = await _fs.isMrXActive();
-        if (isActive) {
-          await _fetchMrX();
-          print('✅ _fetchMrX completed');
-        }
+        await _checkInitialPing();
+        print('✅ Initial Ping check completed');
       }
 
       _startTimers();
       print('✅ _startTimers completed');
     } catch (e) {
       print('❌ _initializeMap failed: $e');
-      // ✅ Fallback: Trotzdem Timer starten für bessere UX
       if (mounted) {
         _startTimers();
       }
@@ -588,10 +775,21 @@ class _MapScreenState extends State<MapScreen>
 
   Future<void> _fetchMrX() async {
     try {
-      final info = await _fs.getMrXWithName();
-      if (info == null) return;
-      final pos = LatLng(info['latitude'], info['longitude']);
-      _updateMrXMarker(pos);
+      // ✅ WIRD NICHT MEHR VERWENDET - Hunter sehen nur Pings
+      // Diese Methode bleibt als Backup oder für zukünftige Erweiterungen
+      final pingData = await _fs.getLatestValidPing();
+      if (pingData != null && pingData['isValid'] == true) {
+        final geo = pingData['location'] as GeoPoint;
+        final pos = LatLng(geo.latitude, geo.longitude);
+        _updateMrXMarker(pos);
+        print('✅ Mr.X durch Ping angezeigt: $pos');
+      } else {
+        print('ℹ️ Kein gültiger Ping verfügbar - Mr.X bleibt versteckt');
+
+        setState(() {
+          _markers.removeWhere((m) => m.key == const ValueKey('mrx'));
+        });
+      }
     } catch (e) {
       print('Fetch Mr.X failed: $e');
     }
