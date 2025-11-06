@@ -64,21 +64,25 @@ class AuthService extends ChangeNotifier {
     await loadGameUsername();
   }
 
+// Korrigierte logout Methode
   Future<void> logout({required bool deleteData}) async {
     try {
       print('🔄 Starte Logout-Prozess...');
 
+      // ✅ WICHTIG: Rolle zuerst lokal löschen
+      final currentRole = role;
+      role = null;
+
       if (deleteData) {
         print('📝 Lösche ALLE User-Daten...');
-        await _fs.deleteUserData(isHunter: role == Role.hunter);
+        await _fs.deleteUserData(isHunter: currentRole == Role.hunter);
       } else {
         print('📝 Lösche nur Standort-Daten...');
-        await _fs.deleteLocationOnly(isHunter: role == Role.hunter);
+        await _fs.deleteLocationOnly(isHunter: currentRole == Role.hunter);
       }
 
       // Lokale Daten KOMPLETT zurücksetzen
-      role = null;
-      _gameUsername = null; // WICHTIG: Username lokal löschen
+      _gameUsername = null;
 
       print('🚪 Firebase SignOut...');
       await _auth.signOut();
@@ -89,9 +93,9 @@ class AuthService extends ChangeNotifier {
       }
 
       notifyListeners();
-      print('✅ Logout abgeschlossen - Alle Daten gelöscht');
+      print('✅ Logout abgeschlossen');
     } catch (e) {
-      print('❌ Kritischer Fehler im Logout: $e');
+      print('❌ Fehler im Logout: $e');
       // Sicherstellen dass zumindest lokal alles gelöscht wird
       role = null;
       _gameUsername = null;

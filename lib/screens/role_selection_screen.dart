@@ -29,6 +29,7 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
   Future<void> _loadData() async {
     setState(() => _loading = true);
     try {
+      // ✅ VERBESSERT: Direktes Neuladen der Daten ohne Cache
       final users = await _fs.getAllUsernames();
 
       // ✅ VERBESSERT: Verwende die gleiche Methode wie in der Map
@@ -38,7 +39,7 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
 
       setState(() {
         _usernames = users;
-        _hunterCount = hunters.length; // Direkt die Länge der Map
+        _hunterCount = hunters.length;
         _mrXExists = isMrXActive;
         _error = null;
       });
@@ -49,6 +50,11 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
       print('- Hunter Count: $_hunterCount');
       print('- Mr.X existiert: $_mrXExists');
       print('- Mr.X Username: $mrxUsername');
+
+      // ✅ Zusätzliche Validierung
+      if (_usernames.isEmpty) {
+        print('ℹ️ Keine User in der Datenbank gefunden');
+      }
     } catch (e) {
       print('❌ Fehler in _loadData: $e');
       setState(() => _error = 'Konnte Daten nicht laden: $e');
@@ -104,9 +110,18 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen> {
       await _fs.deleteAllGameData();
       print('✅ Datenlöschung erfolgreich');
 
+      // ✅ WICHTIG: Lokalen State zurücksetzen
+      setState(() {
+        _usernames = [];
+        _hunterCount = 0;
+        _mrXExists = false;
+      });
+
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Alle Spieldaten gelöscht.')));
 
+      // ✅ VERBESSERT: Kurze Verzögerung bevor Neuladen
+      await Future.delayed(const Duration(seconds: 1));
       await _loadData();
     } catch (e) {
       print('❌ Fehler beim Löschen: $e');

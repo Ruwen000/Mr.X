@@ -32,13 +32,16 @@ class FirestoreService {
 
   Future<List<String>> getAllUsernames() async {
     try {
-      final snap = await _db.collection('users').get();
+      // ✅ VERBESSERT: Force refresh ohne Cache
+      final snap =
+          await _db.collection('users').get(GetOptions(source: Source.server));
+
       final usernames = snap.docs
           .map((d) => (d.data()['username'] ?? '') as String)
           .where((u) => u.isNotEmpty)
           .toList();
 
-      print('📊 Gefundene Usernamen: $usernames');
+      print('📊 Gefundene Usernamen: $usernames (${usernames.length} User)');
       return usernames;
     } catch (e) {
       print('❌ Fehler beim Abrufen der Usernamen: $e');
@@ -143,20 +146,23 @@ class FirestoreService {
       if (!doc.exists) return null;
 
       final data = doc.data()!;
-      final timestamp = data['timestamp'] as Timestamp?; // Korrektes Feld
+      final timestamp = data['timestamp'] as Timestamp?;
       final location = data['location'] as GeoPoint?;
 
       if (timestamp == null || location == null) return null;
 
+      // ✅ KORRIGIERT: Ping immer zurückgeben, egal wie alt (nur Validität prüfen)
       final now = DateTime.now();
       final pingTime = timestamp.toDate();
+      final isValid =
+          now.difference(pingTime).inMinutes <= 1; // 10 Minuten gültig
 
-      // Nur Pings der letzten 10 Minuten zurückgeben
-      if (now.difference(pingTime).inMinutes <= 1) {
-        return {'location': location, 'timestamp': timestamp, 'isValid': true};
-      }
-
-      return null;
+      return {
+        'location': location,
+        'timestamp': timestamp,
+        'isValid': isValid,
+        'pingTime': pingTime // Für Debugging
+      };
     } catch (e) {
       print('❌ Fehler in getLatestValidPing: $e');
       return null;
@@ -192,16 +198,19 @@ class FirestoreService {
 
   Future<bool> isMrXActive() async {
     try {
+      final usersSnap = await _db
+          .collection('users')
+          .where('role', isEqualTo: 'mrx')
+          .limit(1)
+          .get();
+
+      final hasMrXRole = usersSnap.docs.isNotEmpty;
+
       final gameDoc = await _db.collection('games').doc('current').get();
-      if (!gameDoc.exists) return false;
+      final hasMrXLocation = gameDoc.exists &&
+          (gameDoc.data()?['mrx'] as Map<String, dynamic>?)?.isNotEmpty == true;
 
-      final gameData = gameDoc.data()!;
-      final mrxData = gameData['mrx'] as Map<String, dynamic>?;
-
-      final isActive = mrxData != null && mrxData.isNotEmpty;
-      print('🎯 Mr.X Aktivitätsprüfung: $isActive (Daten: $mrxData)');
-
-      return isActive;
+      return hasMrXRole && hasMrXLocation;
     } catch (e) {
       print('❌ Fehler in isMrXActive: $e');
       return false;
@@ -275,7 +284,7 @@ class FirestoreService {
 
   Future<void> deleteAllGameData() async {
     try {
-      print('🔄 Starte Löschvorgang für ALLE Spieldaten...');
+      print('🔄 Starte KOMPLETTE Löschung ALLER Spieldaten...');
 
       // 1. Lösche zuerst alle Subcollections unter 'games/current'
       await _deleteSubcollections('games/current');
@@ -284,33 +293,58 @@ class FirestoreService {
       await _db.collection('games').doc('current').delete();
       print('✅ Spiel-Dokument gelöscht');
 
-      // 3. Setze alle User-Rollen zurück (aber lösche nicht die User!)
+      // 3. ✅ KORRIGIERT: Lösche ALLE User-Dokumente komplett
       final usersSnap = await _db.collection('users').get();
-      final batch = _db.batch();
+      final userBatch = _db.batch();
 
       for (var doc in usersSnap.docs) {
-        batch.update(doc.reference, {
-          'role': FieldValue.delete(),
-        });
+        userBatch.delete(doc.reference);
+        print('🗑️ Markiere User zum Löschen: ${doc.id}');
       }
 
-      await batch.commit();
-      print('✅ User-Rollen zurückgesetzt: ${usersSnap.docs.length} User');
+      await userBatch.commit();
+      print('✅ ALLE User-Dokumente gelöscht: ${usersSnap.docs.length} User');
 
-      print('✅ ALLE Spieldaten erfolgreich gelöscht!');
+      // 4. ✅ Zusätzlich: Lösche auch alle Pings falls vorhanden
+      try {
+        final pingsSnap = await _db
+            .collection('games')
+            .doc('current')
+            .collection('pings')
+            .get();
+
+        final pingBatch = _db.batch();
+        for (var doc in pingsSnap.docs) {
+          pingBatch.delete(doc.reference);
+        }
+        await pingBatch.commit();
+        print('✅ Pings gelöscht: ${pingsSnap.docs.length}');
+      } catch (e) {
+        print('ℹ️ Keine Pings zum Löschen gefunden: $e');
+      }
+
+      print('✅✅✅ ALLE Spieldaten erfolgreich gelöscht!');
     } catch (e) {
       print('❌ Fehler beim Löschen aller Daten: $e');
 
       // Fallback: Einzelne Löschvorgänge
       try {
-        await _deleteSubcollections('games/current');
+        print('🔄 Starte Fallback-Löschung...');
+
+        // Fallback für games
         await _db.collection('games').doc('current').delete();
+
+        // Fallback für users - lösche jeden User einzeln
+        final usersSnap = await _db.collection('users').get();
+        for (var doc in usersSnap.docs) {
+          await doc.reference.delete();
+        }
+
         print('✅ Fallback-Löschung erfolgreich');
       } catch (e2) {
         print('❌ Auch Fallback fehlgeschlagen: $e2');
+        rethrow;
       }
-
-      rethrow;
     }
   }
 
@@ -318,18 +352,22 @@ class FirestoreService {
     try {
       print('🗑️ Lösche Subcollections unter: $documentPath');
 
-      // Hole alle Collections unter diesem Dokument
-      final collections = await _db.doc(documentPath).collection('pings').get();
-
       // Lösche alle Dokumente in der pings Subcollection
+      final pingsSnapshot =
+          await _db.doc(documentPath).collection('pings').get();
       final batch = _db.batch();
-      for (var doc in collections.docs) {
+
+      for (var doc in pingsSnapshot.docs) {
         batch.delete(doc.reference);
+        print('🗑️ Lösche Ping: ${doc.id}');
       }
 
-      await batch.commit();
+      if (pingsSnapshot.docs.isNotEmpty) {
+        await batch.commit();
+      }
+
       print(
-          '✅ Subcollections gelöscht: ${collections.docs.length} Pings unter $documentPath');
+          '✅ Subcollections gelöscht: ${pingsSnapshot.docs.length} Pings unter $documentPath');
     } catch (e) {
       print('❌ Fehler beim Löschen der Subcollections: $e');
       // Wir werfen den Fehler nicht weiter, da das Hauptdokument trotzdem gelöscht werden soll
